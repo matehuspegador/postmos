@@ -1,0 +1,188 @@
+name: Build postmarketOS - Moto Edge 30 (dubai)
+
+on:
+  workflow_dispatch: {}
+  # Descomente para builds semanais automáticos:
+  # schedule:
+  #   - cron: '0 0 * * 5'   # toda sexta à meia-noite UTC
+
+env:
+  KERNEL_REPO: https://gitlab.com/sahaRatul/moto_dubai_linux_mainline_kernel.git
+  KERNEL_BRANCH: sm7325_moto_dubai_pmos
+  DEVICE_PMAPORTS_REPO: https://gitlab.com/sahaRatul/device-motorola-dubai.git
+  DEVICE_PMAPORTS_BRANCH: master
+  PMOS_UI: phosh          # interface gráfica mobile-friendly (GNOME/Phosh)
+  PMOS_HOSTNAME: motorola-dubai
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # limite do runner gratuito é 360min/6h
+    steps:
+      - name: Liberar espaço em disco no runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+            /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker image prune -a -f || true
+          df -h
+
+      - name: Instalar dependências
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git python3 python3-pip qemu-user-static binfmt-support \
+            bc bison flex libssl-dev libelf-dev ccache build-essential \
+            clang lld llvm kpartx android-sdk-libsparse-utils expect
+
+      - name: Cache do ccache (acelera builds seguintes do kernel)
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-dubai-${{ github.run_id }}
+          restore-keys: |
+            ccache-dubai-
+
+      # ---------------------------------------------------------------
+      # 1) Instalar o pmbootstrap
+      #    postmarketOS migrou do gitlab.com para gitlab.postmarketos.org
+      #    em out/2024. Clonar de gitlab.com falha (exit code 1) e aborta
+      #    o job — por isso o clone abaixo aponta para o domínio novo.
+      # ---------------------------------------------------------------
+      - name: Instalar pmbootstrap
+        run: |
+          git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git ~/pmbootstrap
+          sudo ln -sf ~/pmbootstrap/pmbootstrap.py /usr/local/bin/pmbootstrap
+          pmbootstrap --version
+
+      # ---------------------------------------------------------------
+      # 2) Rodar "pmbootstrap init" (é o primeiro passo na thread,
+      #    antes de qualquer clone de kernel/device)
+      # ---------------------------------------------------------------
+      - name: Inicializar pmbootstrap de forma não interativa
+        run: |
+          # pmbootstrap init é um wizard interativo cujos prompts mudam de
+          # ordem/conteúdo entre versões (ex: versões recentes adicionaram
+          # o prompt "Location of the 'pmaports' path" entre "Work path" e
+          # "vendor", o que travava um script expect com sequência fixa).
+          # Por isso usamos casamento por palavra-chave com fallback: para
+          # qualquer prompt não reconhecido que termine em "[algo]:", só
+          # aceitamos o valor padrão com Enter.
+          cat > /tmp/pmb_init.exp <<'EOF'
+          set timeout 240
+          spawn pmbootstrap init
+          expect {
+            -re {[Vv]endor} { send "motorola\r"; exp_continue }
+            -re {codename} { send "dubai\r"; exp_continue }
+            -re {correct.*\(y/n\)} { send "y\r"; exp_continue }
+            -re {[Kk]ernel.*\[} { send "mainline\r"; exp_continue }
+            -re {User interface} { send "$env(PMOS_UI)\r"; exp_continue }
+            -re {hostname} { send "$env(PMOS_HOSTNAME)\r"; exp_continue }
+            -re {[Ll]ocale} { send "en_US.UTF-8\r"; exp_continue }
+            -re {[Tt]imezone} { send "y\r"; exp_continue }
+            -re {SSH keys} { send "n\r"; exp_continue }
+            -re {UI [Ee]xtras} { send "n\r"; exp_continue }
+            -re {Extra packages} { send "\r"; exp_continue }
+            -re {Zap Existing Chroots} { send "y\r"; exp_continue }
+            -re {\[[^\]]*\]:\s*$} { send "\r"; exp_continue }
+            timeout { send "\r"; exp_continue }
+            eof
+          }
+          EOF
+          expect -f /tmp/pmb_init.exp
+          pmbootstrap config device
+          pmbootstrap config ui
+          pmbootstrap config hostname
+
+      # ---------------------------------------------------------------
+      # 3) Clonar a config do device (motorola-dubai) e copiar para
+      #    dentro do pmaports local do pmbootstrap, como na thread
+      # ---------------------------------------------------------------
+      - name: Clonar pacote pmaports do device (motorola-dubai)
+        run: |
+          git clone --depth=1 -b "${DEVICE_PMAPORTS_BRANCH}" "${DEVICE_PMAPORTS_REPO}" ~/device-motorola-dubai
+
+      - name: Copiar pacote do device para o pmaports local
+        run: |
+          PMAPORTS_DEVICE_DIR=~/.local/var/pmbootstrap/cache_git/pmaports/device/testing/device-motorola-dubai
+          mkdir -p "$PMAPORTS_DEVICE_DIR"
+          cp -r ~/device-motorola-dubai/* "$PMAPORTS_DEVICE_DIR"/
+
+      # ---------------------------------------------------------------
+      # 4) Clonar o kernel mainline com patches (sahaRatul)
+      # ---------------------------------------------------------------
+      - name: Clonar kernel mainline (sahaRatul, branch sm7325_moto_dubai_pmos)
+        run: |
+          git clone --depth=1 -b "${KERNEL_BRANCH}" "${KERNEL_REPO}" ~/kernel
+
+      # ---------------------------------------------------------------
+      # 5) Compilar o kernel exatamente como na thread:
+      #    envkernel.sh -> make defconfig -> make -jN
+      # ---------------------------------------------------------------
+      - name: Compilar o kernel (make)
+        run: |
+          export CCACHE_DIR=~/.ccache
+          export USE_CCACHE=1
+          cd ~/kernel
+          source ~/pmbootstrap/helpers/envkernel.sh
+          make sm7325_moto_dubai_defconfig
+          make -j"$(nproc)"
+
+      # ---------------------------------------------------------------
+      # 6) Empacotar o kernel compilado como pacote pmOS
+      # ---------------------------------------------------------------
+      - name: Empacotar o kernel para o postmarketOS
+        run: |
+          cd ~/kernel
+          source ~/pmbootstrap/helpers/envkernel.sh
+          pmbootstrap build --envkernel linux-next
+
+      # ---------------------------------------------------------------
+      # 7) Compilar o pacote do device (rootfs base)
+      # ---------------------------------------------------------------
+      - name: Compilar o pacote do device (rootfs base)
+        run: |
+          pmbootstrap build device-motorola-dubai
+
+      # ---------------------------------------------------------------
+      # 8) Passo final da thread antes do boot: dentro do chroot do
+      #    rootfs, comentar as linhas 65,66,67,88,89,90 de
+      #    /usr/share/initramfs/init_functions.sh (adicionando "#" no
+      #    início de cada uma) para o initramfs conseguir montar a raiz
+      #    corretamente. Na thread isso é feito interativamente com
+      #    vi/nano dentro de "pmbootstrap chroot -r"; aqui usamos
+      #    "pmbootstrap chroot -r --" com sed para rodar sem interação
+      #    em CI. Depois deste passo, os passos 8 e 9 originais da
+      #    thread (build device package + install/export) são repetidos
+      #    — o que já corresponde aos steps seguintes deste workflow.
+      # ---------------------------------------------------------------
+      - name: Comentar linhas do init_functions.sh no chroot do rootfs
+        run: |
+          pmbootstrap chroot -r -- sed -i \
+            -e '65s/^/#/' -e '66s/^/#/' -e '67s/^/#/' \
+            -e '88s/^/#/' -e '89s/^/#/' -e '90s/^/#/' \
+            /usr/share/initramfs/init_functions.sh
+          pmbootstrap chroot -r -- sed -n '60,95p' /usr/share/initramfs/init_functions.sh
+
+      # ---------------------------------------------------------------
+      # Repete o "step 8 e 9" da thread após o ajuste: recompilar o
+      # pacote do device (regenera o initramfs com o arquivo alterado)
+      # ---------------------------------------------------------------
+      - name: Recompilar pacote do device após o ajuste (repete step 8)
+        run: |
+          pmbootstrap build device-motorola-dubai --force
+
+      # ---------------------------------------------------------------
+      # 9) Gerar a imagem final e exportar os artefatos
+      # ---------------------------------------------------------------
+      - name: Gerar a imagem final (boot.img + rootfs)
+        run: |
+          pmbootstrap install --no-fde --password 147147
+          pmbootstrap export
+          cp -rL /tmp/postmarketOS-export ~/pmos-export
+
+      - name: Enviar artefatos
+        uses: actions/upload-artifact@v4
+        with:
+          name: postmarketos-motorola-dubai
+          path: ~/pmos-export
+          retention-days: 7
